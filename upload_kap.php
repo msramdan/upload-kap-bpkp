@@ -76,13 +76,16 @@ class ExcelImportKAP
                 $penugasan_yang_terkait_dengan_pembelajaran = $worksheet->getCell('I' . $row)->getCalculatedValue();
                 $skill_group_owner = $worksheet->getCell('J' . $row)->getCalculatedValue();
                 $metodeName = $worksheet->getCell('K' . $row)->getCalculatedValue();
+                $startTatapMuka = $worksheet->getCell('L' . $row)->getCalculatedValue();
+                $endTatapMuka = $worksheet->getCell('M' . $row)->getCalculatedValue();
+                $startElearning = $worksheet->getCell('N' . $row)->getCalculatedValue();
+                $endElearning = $worksheet->getCell('O' . $row)->getCalculatedValue();
                 $diklatLocName = $worksheet->getCell('P' . $row)->getCalculatedValue();
                 $detail_lokasi = $worksheet->getCell('Q' . $row)->getCalculatedValue();
                 $diklatTypeName = $worksheet->getCell('R' . $row)->getCalculatedValue();
                 $sasaran_peserta = $worksheet->getCell('S' . $row)->getCalculatedValue();
                 $kriteria_peserta = $worksheet->getCell('T' . $row)->getCalculatedValue();
                 $aktivitas_prapembelajaran = $worksheet->getCell('U' . $row)->getCalculatedValue();
-
 
                 // Debug: Tampilkan data yang dibaca
                 echo "<div style='background: #f0f0f0; padding: 10px; margin: 5px 0; border-radius: 5px;'>";
@@ -98,8 +101,8 @@ class ExcelImportKAP
                     continue;
                 }
 
-                // Process data row
-                $result = $this->processRow([
+                // Process data row dengan transaction
+                $result = $this->processRowWithTransaction([
                     'topik_nama' => $topik_nama,
                     'keterangan_program_pembelajaran' => $keterangan_program_pembelajaran,
                     'arahan_pimpinan' => $arahan_pimpinan,
@@ -111,6 +114,10 @@ class ExcelImportKAP
                     'penugasan_yang_terkait_dengan_pembelajaran' => $penugasan_yang_terkait_dengan_pembelajaran,
                     'skill_group_owner' => $skill_group_owner,
                     'metodeName' => $metodeName,
+                    'startTatapMuka' => $startTatapMuka,
+                    'endTatapMuka' => $endTatapMuka,
+                    'startElearning' => $startElearning,
+                    'endElearning' => $endElearning,
                     'detail_lokasi' => $detail_lokasi,
                     'diklatTypeName' => $diklatTypeName,
                     'diklatLocName' => $diklatLocName,
@@ -142,24 +149,21 @@ class ExcelImportKAP
         }
     }
 
-    private function processRow($data, $rowNumber, $maxKaldikIdFromApi)
+    private function processRowWithTransaction($data, $rowNumber, $maxKaldikIdFromApi)
     {
+        // Mulai transaction
+        $this->db->beginTransaction();
+
         try {
             // Validasi data required
             if (empty($data['topik_nama'])) {
-                return [
-                    'success' => false,
-                    'message' => 'Nama Topik Program Pembelajaran harus diisi'
-                ];
+                throw new Exception('Nama Topik Program Pembelajaran harus diisi');
             }
 
             // Cari topik_id berdasarkan nama topik
             $topik_id = $this->getTopikIdByName($data['topik_nama']);
             if (!$topik_id) {
-                return [
-                    'success' => false,
-                    'message' => 'Topik dengan nama "' . $data['topik_nama'] . '" tidak ditemukan di database'
-                ];
+                throw new Exception('Topik dengan nama "' . $data['topik_nama'] . '" tidak ditemukan di database');
             }
 
             // Generate kode_pembelajaran otomatis
@@ -168,11 +172,15 @@ class ExcelImportKAP
             // Data static sesuai permintaan
             $currentDateTime = date('Y-m-d H:i:s');
             $currentTimestamp = date('Y-m-d H:i:s');
+            
+            // Generate judul
             $judul = $data['topik_nama'];
-            if (!empty($data['keterangan_program_pembelajaran']) && trim($data['keterangan_program_pembelajaran']) !== '') {
-                $judul .= ' ' . trim($data['keterangan_program_pembelajaran']);
+            $keterangan = $data['keterangan_program_pembelajaran'] ?? '';
+            if ($keterangan && trim($keterangan) !== '') {
+                $judul .= ' ' . trim($keterangan);
             }
 
+            // Tentukan metodeID
             $metodeID = null;
             if (!empty($data['metodeName'])) {
                 switch ($data['metodeName']) {
@@ -190,6 +198,7 @@ class ExcelImportKAP
                 }
             }
 
+            // Tentukan diklatTypeID
             $diklatTypeID = null;
             if (!empty($data['diklatTypeName'])) {
                 switch ($data['diklatTypeName']) {
@@ -222,6 +231,7 @@ class ExcelImportKAP
                 }
             }
 
+            // Tentukan diklatLocID
             $diklatLocID = null;
             if (!empty($data['diklatLocName'])) {
                 $locations = [
@@ -322,10 +332,7 @@ class ExcelImportKAP
                 $diklatLocID = $locations[$data['diklatLocName']] ?? null;
             }
 
-
-
-
-            // Prepare data untuk insert
+            // Prepare data untuk insert ke pengajuan_kap
             $insertData = [
                 'kode_pembelajaran' => $kode_pembelajaran,
                 'institusi_sumber' => 'Non BPKP',
@@ -386,18 +393,167 @@ class ExcelImportKAP
             echo "<div style='color: purple; padding: 5px;'>Topik ID: $topik_id, Kode Pembelajaran: $kode_pembelajaran</div>";
 
             // Insert ke tabel pengajuan_kap
-            $success = $this->insertPengajuanKAP($insertData);
-
-            if ($success) {
-                return ['success' => true, 'message' => 'Data berhasil diimport'];
-            } else {
-                return ['success' => false, 'message' => 'Gagal menyimpan data ke database'];
+            $pengajuanKapId = $this->insertPengajuanKAP($insertData);
+            
+            if (!$pengajuanKapId) {
+                throw new Exception('Gagal menyimpan data ke database pengajuan_kap');
             }
+
+            // Insert ke waktu_pelaksanaan berdasarkan metodeID
+            $this->insertWaktuPelaksanaan($pengajuanKapId, $metodeID, $data);
+
+            // Insert ke log_review_pengajuan_kap
+            $this->insertLogReview($pengajuanKapId);
+
+            // Insert ke indikator_keberhasilan_kap
+            $this->insertIndikatorKeberhasilan($pengajuanKapId, $data['indikator_keberhasilan']);
+
+            // Insert ke level_evaluasi_instrumen_kap
+            $this->insertLevelEvaluasiInstrumen($pengajuanKapId);
+
+            // Commit transaction
+            $this->db->commit();
+
+            return ['success' => true, 'message' => 'Data berhasil diimport'];
+
         } catch (Exception $e) {
-            return [
-                'success' => false,
-                'message' => 'Error processing row: ' . $e->getMessage()
-            ];
+            // Rollback transaction
+            $this->db->rollBack();
+            return ['success' => false, 'message' => $e->getMessage()];
+        }
+    }
+
+    private function insertWaktuPelaksanaan($pengajuanKapId, $metodeID, $data)
+    {
+        $currentTimestamp = date('Y-m-d H:i:s');
+
+        if ($metodeID === '1') {
+            // Full Tatap Muka
+            $this->db->prepare("INSERT INTO waktu_pelaksanaan (pengajuan_kap_id, remarkMetodeName, tanggal_mulai, tanggal_selesai, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?)")
+                ->execute([
+                    $pengajuanKapId,
+                    'Full Tatap Muka',
+                    $this->formatExcelDate($data['startTatapMuka']),
+                    $this->formatExcelDate($data['endTatapMuka']),
+                    $currentTimestamp,
+                    $currentTimestamp
+                ]);
+        } elseif ($metodeID === '2') {
+            // Blended Learning - Insert E-Learning data
+            $this->db->prepare("INSERT INTO waktu_pelaksanaan (pengajuan_kap_id, remarkMetodeName, tanggal_mulai, tanggal_selesai, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?)")
+                ->execute([
+                    $pengajuanKapId,
+                    'E-Learning',
+                    $this->formatExcelDate($data['startElearning']),
+                    $this->formatExcelDate($data['endElearning']),
+                    $currentTimestamp,
+                    $currentTimestamp
+                ]);
+
+            // Blended Learning - Insert Tatap Muka data
+            $this->db->prepare("INSERT INTO waktu_pelaksanaan (pengajuan_kap_id, remarkMetodeName, tanggal_mulai, tanggal_selesai, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?)")
+                ->execute([
+                    $pengajuanKapId,
+                    'Tatap Muka',
+                    $this->formatExcelDate($data['startTatapMuka']),
+                    $this->formatExcelDate($data['endTatapMuka']),
+                    $currentTimestamp,
+                    $currentTimestamp
+                ]);
+        } else {
+            // Full E-Learning atau lainnya
+            $this->db->prepare("INSERT INTO waktu_pelaksanaan (pengajuan_kap_id, remarkMetodeName, tanggal_mulai, tanggal_selesai, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?)")
+                ->execute([
+                    $pengajuanKapId,
+                    'Full E-Learning',
+                    $this->formatExcelDate($data['startElearning']),
+                    $this->formatExcelDate($data['endElearning']),
+                    $currentTimestamp,
+                    $currentTimestamp
+                ]);
+        }
+    }
+
+    private function formatExcelDate($excelDate)
+    {
+        if (is_numeric($excelDate)) {
+            // Convert Excel serial date to PHP DateTime
+            $unixTimestamp = ($excelDate - 25569) * 86400; // 25569 = days from 1900-01-01 to 1970-01-01
+            return date('Y-m-d', $unixTimestamp);
+        }
+        return $excelDate ? date('Y-m-d', strtotime($excelDate)) : null;
+    }
+
+    private function insertLogReview($pengajuanKapId)
+    {
+        $currentTimestamp = date('Y-m-d H:i:s');
+        $remarks = [
+            'Biro SDM',
+            'Tim Unit Pengelola Pembelajaran',
+            'Penjaminan Mutu',
+            'Subkoordinator',
+            'Koordinator',
+            'Kepala Unit Pengelola Pembelajaran'
+        ];
+
+        foreach ($remarks as $index => $remark) {
+            $this->db->prepare("INSERT INTO log_review_pengajuan_kap (pengajuan_kap_id, step, remark, user_review_id, status, tanggal_review, catatan, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)")
+                ->execute([
+                    $pengajuanKapId,
+                    $index + 1,
+                    $remark,
+                    null,
+                    'Pending',
+                    null,
+                    '',
+                    $currentTimestamp,
+                    $currentTimestamp
+                ]);
+        }
+    }
+
+    private function insertIndikatorKeberhasilan($pengajuanKapId, $indikatorData)
+    {
+        $currentTimestamp = date('Y-m-d H:i:s');
+        
+        // Split indikator berdasarkan ;
+        $indikators = $indikatorData ? explode(';', $indikatorData) : [];
+        
+        // Insert maksimal 10 data
+        for ($i = 0; $i < 10; $i++) {
+            $indikator = isset($indikators[$i]) ? trim($indikators[$i]) : null;
+            
+            $this->db->prepare("INSERT INTO indikator_keberhasilan_kap (pengajuan_kap_id, indikator_keberhasilan, created_at, updated_at) VALUES (?, ?, ?, ?)")
+                ->execute([
+                    $pengajuanKapId,
+                    $indikator,
+                    $currentTimestamp,
+                    $currentTimestamp
+                ]);
+        }
+    }
+
+    private function insertLevelEvaluasiInstrumen($pengajuanKapId)
+    {
+        $currentTimestamp = date('Y-m-d H:i:s');
+        
+        $levels = [
+            1 => 'Evaluasi atas penyelenggaraan, materi, dan instruktur pelatihan',
+            2 => 'Pretest dan Post-Test',
+            3 => 'Evaluasi dampak pembelajaran terhadap perilaku alumni (kemampuan berbagi dan implementasi keilmuan, motivasi, dan kepercayaan diri)',
+            4 => 'Evaluasi dampak pembelajaran terhadap kinerja organisasi',
+            5 => null
+        ];
+
+        foreach ($levels as $level => $keterangan) {
+            $this->db->prepare("INSERT INTO level_evaluasi_instrumen_kap (pengajuan_kap_id, level, keterangan, created_at, updated_at) VALUES (?, ?, ?, ?, ?)")
+                ->execute([
+                    $pengajuanKapId,
+                    $level,
+                    $keterangan,
+                    $currentTimestamp,
+                    $currentTimestamp
+                ]);
         }
     }
 
@@ -542,16 +698,15 @@ class ExcelImportKAP
             $result = $stmt->execute($data);
 
             if ($result) {
-                echo "<div style='color: green; padding: 5px;'>Insert BERHASIL</div>";
-                return true;
+                $lastInsertId = $this->db->lastInsertId();
+                echo "<div style='color: green; padding: 5px;'>Insert BERHASIL, ID: $lastInsertId</div>";
+                return $lastInsertId;
             } else {
                 $errorInfo = $stmt->errorInfo();
-                echo "<div style='color: red; padding: 5px;'>Insert GAGAL: " . $errorInfo[2] . "</div>";
-                return false;
+                throw new Exception("Insert GAGAL: " . $errorInfo[2]);
             }
         } catch (PDOException $e) {
-            echo "<div style='color: red; padding: 5px;'>PDO Exception: " . $e->getMessage() . "</div>";
-            return false;
+            throw new Exception("PDO Exception: " . $e->getMessage());
         }
     }
 }
@@ -588,3 +743,4 @@ if ($result['success']) {
 }
 
 echo "</div>";
+?>
